@@ -1,6 +1,6 @@
 ﻿# KKNEED_RAG
 
-一个面向学术文献场景的本地 RAG 系统，支持文献检索、问答、统计分析与增量更新，提供 Streamlit 可视化界面。
+一个面向学术文献场景的本地 RAG 系统，支持文献检索、问答、统计分析与增量更新，让你告别GPT,DeepSeek查询文献时的胡言乱语，摆脱Endnote,Zotero等复杂的文献管理软件。
 
 ## 功能特性
 
@@ -23,10 +23,10 @@
 ```text
 KKNEED_RAG/
 ├─ Rag_Modules/          # 数据预处理、索引构建、检索优化、生成集成
-├─ Article_Data/         # 文献数据目录（建议本地维护，不直接入库）
-├─ Vector_Index/         # 向量索引目录（建议本地维护，不直接入库）
+├─ Article_Data/         # 文献数据目录（本地维护）
+├─ Vector_Index/         # 向量索引目录（本地维护）
 ├─ streamlit_ui.py       # Streamlit 入口
-├─ config_data.py        # 运行配置（通过 .env 注入敏感信息）
+├─ config_data.py        # 运行配置（通过 .env 注入API-KEY等敏感信息）
 ├─ .env.example          # 环境变量示例
 └─ requirements.txt      # Python 依赖
 ```
