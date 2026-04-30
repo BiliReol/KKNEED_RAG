@@ -1,13 +1,17 @@
 from langchain_core.documents import Document
 from langchain_text_splitters import MarkdownHeaderTextSplitter
-from typing import List,Dict,Any
+from typing import List,Dict,Any,Optional
 from pathlib import Path
 from dotenv import load_dotenv
 import uuid
 import re
 import hashlib
 import json
+import logging
+import config_data
+from langchain_openai import ChatOpenAI
 load_dotenv()
+logger = logging.getLogger(__name__)
 class DataPreparationModule:
     """负责文献数据的加载和预处理"""
     
@@ -23,6 +27,7 @@ class DataPreparationModule:
         self.documents:List[Document]=[] #父文档（原始文献）
         self.chunks:List[Document]=[] #子文档chunk
         self.parent_child_map:Dict[str,str]={}#子块ID->父文档ID映射
+        self._metadata_llm = None
     
     def _calculate_file_hash(self,file_path:Path)->str:
         sha256=hashlib.sha256()#创建一个SHA256哈希计算器
@@ -31,10 +36,38 @@ class DataPreparationModule:
                 sha256.update(chunk)#把每一块数据喂给 SHA256 计算器
         return sha256.hexdigest()#最终输出64位十六进制字符串
     
-    def load_documents(self)->List[Document]:
+    def load_documents(self,md_files:Optional[List[str]]=None)->List[Document]:
         documents=[]
         data_path_obj=Path(self.data_path)
-        for md_file in data_path_obj.rglob("*.md"):
+
+        # 如果传入本次上传文件列表，只处理这批文件并基于 metadata 的 sha256 去重。
+        # 不传 md_files 时保持全量加载（不依赖历史 metadata 去重），避免影响常规构建流程。
+        if md_files:
+            self.sha256set = set()
+            metadata_path = Path(getattr(config_data, "PARENT_METADATA_JSON_PATH", "./Vector_Index/article_metadata.json"))
+            if metadata_path.exists():
+                try:
+                    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    articles = payload.get("articles", [])
+                    if isinstance(articles, list):
+                        for article in articles:
+                            if isinstance(article, dict):
+                                sha = article.get("sha256")
+                                if sha:
+                                    self.sha256set.add(str(sha).strip())
+                except Exception:
+                    # metadata 异常时继续走本地计算，不中断加载流程
+                    pass
+            candidates = [Path(p) for p in md_files]
+        else:
+            self.sha256set = set()
+            candidates = list(data_path_obj.rglob("*.md"))
+
+        for md_file in candidates:
+            if not md_file.exists():
+                continue
+            if md_file.suffix.lower() != ".md":
+                continue
             print(md_file)
             temp_256 = self._calculate_file_hash(md_file)#计算输入文件的sha256
             if temp_256 in self.sha256set:#如果已经存在过，则跳过
@@ -43,14 +76,15 @@ class DataPreparationModule:
             self.sha256set.add(temp_256)
             with open(md_file,"r",encoding='utf-8') as f :
                 content = f.read()
-                
+
             parent_id = str(uuid.uuid4())#用来生成唯一标识符
-            
+
             doc = Document(
                 page_content = content,
                 metadata={
                     "source":str(md_file),
                     "parent_id":parent_id,
+                    "sha256":temp_256,
                     "doc_type":"parent",#标记为父文档
                 }
             )
@@ -63,27 +97,145 @@ class DataPreparationModule:
         return documents
 
     def _enhance_metadata(self,doc:Document):
-        """增强文档元数据"""
-        file_path =  Path(doc.metadata.get('source',''))
-        path_parts=file_path.parts
-        
+        """Enhance metadata with rule-based extraction first, then LLM fallback for missing fields."""
+        file_path = Path(doc.metadata.get('source',''))
+
         enhanced = {
-            "file_name":file_path.name,
-            "title":"",
-            "authors":"",
-            "year":"",
-            "venue":"",
-            "doi":"",
+            "file_name": file_path.name,
+            "title": "",
+            "authors": "",
+            "year": "",
+            "venue": "",
+            "doi": "",
         }
-        enhanced["title"] = self._extract_enhanced_metadata(doc.page_content,"title")
-        enhanced["authors"] = self._extract_enhanced_metadata(doc.page_content,"authors")
-        enhanced["year"] = self._extract_enhanced_metadata(doc.page_content,"year")
-        enhanced["venue"] = self._extract_enhanced_metadata(doc.page_content,"venue")
-        enhanced["doi"] = self._extract_enhanced_metadata(doc.page_content,"doi")       
-        for key in enhanced:
-            #print(f"{key}:{enhanced[key]}")
-            doc.metadata[key]=enhanced[key]
-    
+
+        # 1) Rule-based extraction
+        enhanced["title"] = self._extract_enhanced_metadata(doc.page_content, "title")
+        enhanced["authors"] = self._extract_enhanced_metadata(doc.page_content, "authors")
+        enhanced["year"] = self._extract_enhanced_metadata(doc.page_content, "year")
+        enhanced["venue"] = self._extract_enhanced_metadata(doc.page_content, "venue")
+        enhanced["doi"] = self._extract_enhanced_metadata(doc.page_content, "doi")
+
+        # 2) LLM fallback only for missing fields
+        missing_keys = [k for k in ["title", "authors", "year", "venue", "doi"] if not enhanced.get(k)]
+        if missing_keys:
+            llm_meta = self.llm_extract_metadata(doc.page_content, max_lines=200)
+            for k in missing_keys:
+                v = llm_meta.get(k)
+                if v:
+                    enhanced[k] = v
+
+        for key, value in enhanced.items():
+            doc.metadata[key] = value
+
+    def _get_metadata_llm(self):
+        if self._metadata_llm is not None:
+            return self._metadata_llm
+        try:
+            self._metadata_llm = ChatOpenAI(
+                model=config_data.LLM_MODEL,
+                temperature=0,
+                max_tokens=512,
+                api_key=config_data.DEEPSEEK_API_KEY,
+                base_url=config_data.LLM_BASE_URL,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to initialize metadata LLM: {e}")
+            self._metadata_llm = None
+        return self._metadata_llm
+
+    def llm_extract_metadata(self, text: str, max_lines: int = 200) -> Dict[str, Any]:
+        """Extract metadata using LLM from the first N lines when rule-based extraction misses fields."""
+        llm = self._get_metadata_llm()
+        if llm is None:
+            return {}
+
+        lines = [ln for ln in text.splitlines()]
+        snippet = "\n".join(lines[:max_lines]).strip()
+        if not snippet:
+            return {}
+
+        prompt = (f"""
+        你是一名学术文章元数据提取器。
+        给定论文 Markdown 片段，严格返回合法 JSON（不要解释），只包含字段: title, authors, year, venue, doi。
+
+        规则:
+        - title: string or null
+        - authors: 用分号 ';' 分隔作者，或 null
+        - year: 4位年份字符串（如 '2024'），或 null
+        - venue: 只能是 IEEE / ACM / Elsevier / Springer / null
+        - doi: DOI字符串（如 10.xxxx/...），或 null
+        - 不要输出任何额外字段
+        - 不要输出 Markdown 包裹（如 ```json）
+
+        示例1:
+        输入片段:
+        # MambaMIL: Enhancing Long Sequence Modeling with Sequence Reordering in Computational Pathology
+        Shu Yang, Yihui Wang, Hao Chen
+        Published in IEEE Transactions on Medical Imaging, 2024
+        DOI: 10.1109/TMI.2024.1234567
+
+        输出:
+        {{"title":"MambaMIL: Enhancing Long Sequence Modeling with Sequence Reordering in Computational Pathology","authors":"Shu Yang; Yihui Wang; Hao Chen","year":"2024","venue":"IEEE","doi":"10.1109/TMI.2024.1234567"}}
+
+        现在请处理以下片段:
+        {snippet}
+
+        输出:
+        """
+
+        )
+
+        try:
+            response = llm.invoke(prompt)
+            content = getattr(response, "content", "") or ""
+            content = str(content).strip()
+            fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", content, flags=re.S | re.I)
+            if fenced:
+                content = fenced.group(1).strip()
+            data = json.loads(content)
+            if not isinstance(data, dict):
+                return {}
+        except Exception as e:
+            logger.warning(f"LLM metadata extraction failed: {e}")
+            return {}
+
+        def _norm_text(v):
+            if v is None:
+                return None
+            s = str(v).strip()
+            if not s or s.lower() in {"none", "null", "unknown", "n/a"}:
+                return None
+            return s
+
+        out = {
+            "title": _norm_text(data.get("title")),
+            "authors": _norm_text(data.get("authors")),
+            "year": _norm_text(data.get("year")),
+            "venue": _norm_text(data.get("venue")),
+            "doi": _norm_text(data.get("doi")),
+        }
+
+        # Post validation/normalization
+        if out["year"]:
+            m = re.search(r"\b(19\d{2}|20\d{2})\b", out["year"])
+            out["year"] = m.group(1) if m else None
+
+        if out["venue"]:
+            vlow = out["venue"].lower()
+            if "ieee" in vlow:
+                out["venue"] = "IEEE"
+            elif "acm" in vlow:
+                out["venue"] = "ACM"
+            elif "elsevier" in vlow:
+                out["venue"] = "Elsevier"
+            elif "springer" in vlow:
+                out["venue"] = "Springer"
+            else:
+                out["venue"] = None
+
+        return out
+
     def _extract_enhanced_metadata(self,text:str,value:str)->str:#具体的元数据增强，包括文献的标题，年份，doi，作者，出版社等
         if value == "title":
             lines = [line.strip() for line in text.splitlines() if line.strip()]#把文本按行切开，去掉每行前后的空格，空行
@@ -91,9 +243,9 @@ class DataPreparationModule:
                 if line.startswith("# "):#判断是否有以“#”开头的一级标题
                     return line[2:].strip()#返回去掉“#”的标题
             if lines:
-                return line[0][:200]#否则用文件名作为title
+                return lines[0][:200]#否则用文件名作为title
         elif value in("author" , "authors"):
-            pass
+            return None
         elif value == "year":
             #years = re.findall(r"\b(19\d{2}|20\d{2})\b", text)#1900-2099年
             #if not years:
@@ -113,8 +265,7 @@ class DataPreparationModule:
                 return "Springer"
             return None
         elif value == "doi":
-            m = re.search(r"\b10\.\d{4,9}/[-._;()/:A-Za-z0-9]+\b", text)
-            return m.group(0) if m else None
+            return None
         
     def chunk_documents(self)->List[Document]:
         if not self.documents:
@@ -229,9 +380,31 @@ class DataPreparationModule:
         output_path = Path(path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
+        existing_stars: Dict[str, int] = {}
+        if output_path.exists():
+            try:
+                existing_payload = json.loads(output_path.read_text(encoding="utf-8"))
+                existing_articles = existing_payload.get("articles", [])
+                if isinstance(existing_articles, list):
+                    for article in existing_articles:
+                        if not isinstance(article, dict):
+                            continue
+                        key = str(article.get("sha256") or "").strip()
+                        if not key:
+                            continue
+                        try:
+                            star = int(article.get("star", 0))
+                        except (TypeError, ValueError):
+                            star = 0
+                        star = max(0, min(5, star))
+                        existing_stars[key] = star
+            except Exception:
+                existing_stars = {}
+
         articles = []
         for doc in self.documents:
             metadata = doc.metadata or {}
+            sha = str(metadata.get("sha256") or "").strip()
             article = {
                 "parent_id": metadata.get("parent_id"),
                 "title": metadata.get("title"),
@@ -241,6 +414,8 @@ class DataPreparationModule:
                 "doi": metadata.get("doi"),
                 "source": metadata.get("source"),
                 "file_name": metadata.get("file_name"),
+                "sha256": metadata.get("sha256"),
+                "star": existing_stars.get(sha, 0),
             }
             articles.append(article)
 
