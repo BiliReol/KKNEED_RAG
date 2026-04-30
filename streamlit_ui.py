@@ -502,7 +502,7 @@ def render_stats_panel(metadata_path: str) -> None:
         if str(row.get("authors", "") or "").strip():
             with_authors += 1
 
-    col1 = st.columns(3)
+    col1,col2,col3 = st.columns(3)
     col1.metric("文献数量", total)
 
     ratings: Dict[str, int] = {}
