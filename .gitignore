@@ -1,0 +1,23 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+
+# Runtime/index data (usually private or reproducible)
+Vector_Index/
+
+# Local uploaded source data (may include private docs)
+Article_Data/
+
+# OS files
+.DS_Store
+Thumbs.db
