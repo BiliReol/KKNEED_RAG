@@ -63,8 +63,9 @@ streamlit run streamlit_ui.py
 ## 效果展示
 
 
-![系统架构图占位符](docs/images/architecture-placeholder.png)
-![界面截图占位符](docs/images/ui-placeholder.png)
+![alt text](image.png)
+
+![alt text](image-1.png)
 
 ## 常见问题
 
