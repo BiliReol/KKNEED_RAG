@@ -236,7 +236,7 @@ class DataPreparationModule:
 
         return out
 
-    def _extract_enhanced_metadata(self,text:str,value:str)->str:#具体的元数据增强，包括文献的标题，年份，doi，作者，出版社等
+    def _extract_enhanced_metadata(self,text:str,value:str)->str:#具体的元数据增强，包括文献的标题，年份，doi，作者，出版社等，不过后续还是依靠LLM来提取其他元数据信息
         if value == "title":
             lines = [line.strip() for line in text.splitlines() if line.strip()]#把文本按行切开，去掉每行前后的空格，空行
             for line in lines[:20]:#只看前20行
@@ -282,6 +282,84 @@ class DataPreparationModule:
         self.chunks = chunks
         return chunks
 
+    def _build_header_path(self, metadata: Dict[str, Any]) -> str:
+        header_keys = ["文章标题", "章节名称", "三级标题"]
+        headers = []
+        for key in header_keys:
+            value = metadata.get(key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                headers.append(text)
+        return " > ".join(headers)
+
+    def _find_semantic_split_index(self, window: str, min_cut: int) -> int:
+        # 1) 优先段落边界
+        para_idx = window.rfind("\n\n")
+        if para_idx >= min_cut:
+            return para_idx + 2
+
+        # 2) 其次句号类边界
+        sentence_idx = -1
+        for m in re.finditer(r"[。！？!?；;]\s*", window):
+            if m.end() >= min_cut:
+                sentence_idx = m.end()
+        if sentence_idx != -1:
+            return sentence_idx
+
+        # 3) 再其次逗号类边界
+        comma_idx = -1
+        for m in re.finditer(r"[，,、]\s*", window):
+            if m.end() >= min_cut:
+                comma_idx = m.end()
+        if comma_idx != -1:
+            return comma_idx
+
+        return len(window)
+
+    def _split_section_by_size(
+        self,
+        text: str,
+        chunk_size: int,
+        chunk_overlap: int,
+    ) -> List[str]:
+        content = str(text or "")
+        if not content:
+            return []
+        if len(content) <= chunk_size:
+            return [content]
+
+        parts: List[str] = []
+        n = len(content)
+        start = 0
+
+        while start < n:
+            hard_end = min(start + chunk_size, n)
+            if hard_end >= n:
+                part = content[start:n]
+                if part:
+                    parts.append(part)
+                break
+
+            window = content[start:hard_end]
+            min_cut = max(1, int(chunk_size * 0.4))
+            rel_cut = self._find_semantic_split_index(window, min_cut=min_cut)
+            end = start + rel_cut
+            if end <= start:
+                end = hard_end
+
+            part = content[start:end]
+            if part:
+                parts.append(part)
+
+            next_start = end - chunk_overlap if chunk_overlap > 0 else end
+            if next_start <= start:
+                next_start = end
+            start = next_start
+
+        return parts
+
     def _markdown_header_split(self) -> List[Document]:
         """使用Markdown标题分割器进行结构化分割"""
         # 定义要分割的标题层级
@@ -297,6 +375,15 @@ class DataPreparationModule:
             strip_headers=False  # 保留标题，便于理解上下文
         )
 
+        chunk_size = int(getattr(config_data, "CHUNK_SIZE", 2000) or 2000)
+        chunk_overlap = int(getattr(config_data, "CHUNK_OVERLAP", 400) or 0)
+        if chunk_size <= 0:
+            chunk_size = 2000
+        if chunk_overlap < 0:
+            chunk_overlap = 0
+        if chunk_overlap >= chunk_size:
+            chunk_overlap = max(0, chunk_size - 1)
+
         all_chunks = []
         for doc in self.documents:
             # 对每个文档进行Markdown分割
@@ -305,32 +392,51 @@ class DataPreparationModule:
             #     print(md_chunks)
             # 为每个子块建立与父文档的关系
             parent_id = doc.metadata["parent_id"]
+            chunk_index = 0
 
-            for i, chunk in enumerate(md_chunks):
-                # 为子块分配唯一ID并建立父子关系
-                child_id = str(uuid.uuid4())
-                chunk.metadata.update(doc.metadata)
-                chunk.metadata.update({
-                    "chunk_id": child_id,
-                    "parent_id": parent_id,
-                    "doc_type": "child",  # 标记为子文档
-                    "chunk_index": i      # 在父文档中的位置
-                })
+            for section_index, section_chunk in enumerate(md_chunks):
+                section_text = section_chunk.page_content or ""
+                section_parts = self._split_section_by_size(
+                    section_text,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                )
+                section_metadata = dict(section_chunk.metadata or {})
+                header_path = self._build_header_path(section_metadata)
+                section_id = f"{parent_id}_sec_{section_index}"
 
-                # 建立父子映射关系
-                self.parent_child_map[child_id] = parent_id
+                for part_index, part_text in enumerate(section_parts):
+                    if not str(part_text).strip():
+                        continue
+                    child_id = str(uuid.uuid4())
+                    child_metadata: Dict[str, Any] = {}
+                    child_metadata.update(section_metadata)
+                    child_metadata.update(doc.metadata)
+                    child_metadata.update({
+                        "chunk_id": child_id,
+                        "parent_id": parent_id,
+                        "doc_type": "child",
+                        "chunk_index": chunk_index,
+                        "section_id": section_id,
+                        "chunk_index_in_section": part_index,
+                        "header_path": header_path,
+                    })
+                    child_chunk = Document(
+                        page_content=part_text,
+                        metadata=child_metadata,
+                    )
 
-            all_chunks.extend(md_chunks)
+                    self.parent_child_map[child_id] = parent_id
+                    all_chunks.append(child_chunk)
+                    chunk_index += 1
 
         return all_chunks
     
     def get_parent_document(self,child_chunks:List[Document])->List[Document]:
         """
         根据子块获取对应的父文档（智能去重）
-
         Args:
             child_chunks: 检索到的子块列表
-
         Returns:
             对应的父文档列表（去重，按相关性排序）
         """
@@ -342,7 +448,7 @@ class DataPreparationModule:
             parent_id = chunk.metadata.get('parent_id')
             if parent_id:
                 #增加相关性计数
-                parent_relevance[parent_id]=parent_relevance.get('parent_id',0)+1
+                parent_relevance[parent_id]=parent_relevance.get(parent_id,0)+1
                 #同时缓存父文档，避免重复查找
                 if parent_id not in parent_docs_map:
                     for doc in self.documents:
@@ -355,7 +461,7 @@ class DataPreparationModule:
         parents_docs=[]
         for parent_id in sorted_parent_ids:
             if parent_id in parent_docs_map:
-                parents_docs[parent_id] = parent_docs_map[parent_id]
+                parents_docs.append(parent_docs_map[parent_id])
         return parents_docs
     
         
@@ -432,5 +538,5 @@ class DataPreparationModule:
     
     @classmethod
     def get_supported_venue(cls)->List[str]:
-        return cls.VENUE_MAPPING
+        return list(cls.VENUE_MAPPING.keys())
     

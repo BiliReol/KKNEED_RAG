@@ -2,6 +2,7 @@ from typing import List,Dict,Any
 from langchain.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain.retrievers import BM25Retriever
+import hashlib
 class RetrievalOptimizationModule:
     def __init__(self,vectorstore:FAISS,chunks:List[Document]):
         self.vectorstore = vectorstore
@@ -32,16 +33,38 @@ class RetrievalOptimizationModule:
         rrf_scores={}
         k=60
         for rank,doc in enumerate(vector_results):
-            doc_id = id(doc)#vector_results的结果已经是排好序的，doc_id记录对象的地址身份
+            doc_id = self._stable_doc_id(doc)
             rrf_scores[doc_id] = rrf_scores.get(doc_id,0)+1/(k+rank+1)
         
         for rank,doc in enumerate(bm25_results):
-            doc_id = id(doc)#vector_results的结果已经是排好序的，doc_id记录对象的地址身份
+            doc_id = self._stable_doc_id(doc)
             rrf_scores[doc_id] = rrf_scores.get(doc_id,0)+1/(k+rank+1)
         
-        all_docs = {id(doc):doc for doc in vector_results+bm25_results}
+        all_docs = {self._stable_doc_id(doc):doc for doc in vector_results+bm25_results}
         sorted_docs=sorted(all_docs.items(),key=lambda x:rrf_scores.get(x[0],0),reverse=True)
         return [doc for _,doc in sorted_docs]
+
+    def _stable_doc_id(self, doc: Document) -> str:
+        """为跨检索器融合提供稳定的文档块级唯一键。"""
+        metadata = doc.metadata or {}
+
+        sha256 = str(metadata.get("sha256") or "").strip()
+        chunk_id = str(metadata.get("chunk_id") or "").strip()
+        source = str(metadata.get("source") or "").strip()
+        chunk_index = metadata.get("chunk_index")
+        parent_id = str(metadata.get("parent_id") or "").strip()
+
+        if sha256 and chunk_id:
+            return f"{sha256}::{chunk_id}"
+        if source and chunk_index is not None:
+            return f"{source}::{chunk_index}"
+        if parent_id and chunk_id:
+            return f"{parent_id}::{chunk_id}"
+
+        fallback_text = (
+            f"{source}|{parent_id}|{metadata.get('title', '')}|{doc.page_content or ''}"
+        )
+        return hashlib.sha256(fallback_text.encode("utf-8")).hexdigest()
     
     def metadata_filtered_search(self,query:str,filters:Dict[str,Any],top_k:int=5)->List[Document]:#元数据过滤检索
         vector_retriever = self.vectorstore.as_retriever(

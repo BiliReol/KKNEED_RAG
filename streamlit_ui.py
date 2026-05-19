@@ -385,9 +385,39 @@ def build_rag(force_rebuild: bool = False, incremental_md_files: Optional[List[s
     st.session_state.last_build_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def extract_filters(query: str) -> Dict[str, Any]:
-    #从问题里提取元数据过滤条件（目前主要是期刊名）
+def extract_filters(query: str, rewrite_filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    # 优先使用 query_rewrite 返回的结构化 filters；若不可用再回退到规则提取
     filters: Dict[str, Any] = {}
+
+    if isinstance(rewrite_filters, dict):
+        supported_venues = DataPreparationModule.get_supported_venue()
+        venue_raw = rewrite_filters.get("venue")
+        if venue_raw is not None:
+            venue_text = str(venue_raw).strip()
+            if venue_text and venue_text.lower() not in {"none", "null", "unknown", "n/a"}:
+                for venue in supported_venues:
+                    if venue.lower() == venue_text.lower():
+                        filters["venue"] = venue
+                        break
+
+        # 当前 metadata_filter 只支持精确匹配；仅在明确单一年份时注入 year 过滤
+        year_from_raw = rewrite_filters.get("year_from")
+        year_to_raw = rewrite_filters.get("year_to")
+
+        def _parse_year(v: Any) -> Optional[int]:
+            if v is None:
+                return None
+            m = re.search(r"\b(19\d{2}|20\d{2})\b", str(v))
+            return int(m.group(1)) if m else None
+
+        year_from = _parse_year(year_from_raw)
+        year_to = _parse_year(year_to_raw)
+        if year_from is not None and year_to is not None and year_from == year_to:
+            filters["year"] = str(year_from)
+
+    if filters:
+        return filters
+
     query_lower = query.lower()
     for venue in DataPreparationModule.get_supported_venue():
         if venue.lower() in query_lower:
@@ -411,20 +441,22 @@ def answer_question(question: str) -> str:
 
     route_type = generation_module.query_router(query=question)#首先根据用户问题进行路由查询
 
-    if route_type == "stats":#如果用户问的是统计类问题（比如数据库中有多少文献），一定要提前拦截，避免后续应用query_rewrite方法，应该用专门的generate_stats_answer方法
-        with open(config_data.PARENT_METADATA_JSON_PATH, "r", encoding="utf-8") as f:
-            parent_json = json.load(f)
-        result = generation_module.generate_stats_answer(question, parent_json)
-        if isinstance(result, str):
-            return result
-        return "".join(list(result))
+    rewrite_payload: Dict[str, Any] = {
+        "rewritten_query": question,
+        "keywords": [],
+        "filters": {},
+    }
 
     if route_type == "list":#如果问题类型是list则返回原查询
         rewritten_query = question
     else:
-        rewritten_query = generation_module.query_rewrite(question)
+        rewrite_payload = generation_module.query_rewrite(question)
+        rewritten_query = str(rewrite_payload.get("rewritten_query") or "").strip() or question
 
-    filters = extract_filters(question)#如果问题中包含元过滤（目前仅支持venue元数据过滤）
+    filters = extract_filters(
+        question,
+        rewrite_filters=rewrite_payload.get("filters", {}),
+    )
     if filters:
         relevant_chunks = retrieval_module.metadata_filtered_search(
             rewritten_query,
@@ -432,7 +464,7 @@ def answer_question(question: str) -> str:
             top_k=config_data.TOP_K,
         )
     else:
-        relevant_chunks = retrieval_module.hybrid_search(question)
+        relevant_chunks = retrieval_module.hybrid_search(rewritten_query)
 
     if not relevant_chunks:
         return "No relevant content found. Please try another query or keyword."
@@ -442,7 +474,6 @@ def answer_question(question: str) -> str:
     if route_type == "list":
         # Use chunks directly to avoid dependence on parent mapping bugs.
         return generation_module.generate_list_answer(rewritten_query, relevant_chunks)
-
     if route_type == "concept":
         result = generation_module.generate_concept_answer(rewritten_query, relevant_chunks)
     elif route_type == "fact":
